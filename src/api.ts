@@ -5,18 +5,23 @@ import {
   getWikipediaPageContent,
   getWikipediaPageSummary,
 } from "./services/wikipedia.service.js";
-import { GoogleGenAI } from "@google/genai";
+import OpenAI from "openai";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEN_AI || "",
+
+const openai = new OpenAI({
+  baseURL: "https://openrouter.ai/api/v1",
+  apiKey: process.env.OPENROUTER_API_KEY || "",
 });
+
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// Search Wikipedia articles
 app.get("/api/search", async (req, res) => {
   try {
     const { query, limit } = req.query;
@@ -25,7 +30,8 @@ app.get("/api/search", async (req, res) => {
       return res.status(400).json({ error: "Query parameter is required" });
     }
 
-    const searchLimit = limit ? parseInt(limit as string, 10) : 5;
+    const searchLimit =
+      limit && typeof limit === "string" ? parseInt(limit, 10) : 5;
     const results = await searchWikipediaPages(query, searchLimit);
 
     res.json({ success: true, data: results });
@@ -82,6 +88,15 @@ app.post("/geminiai/chat", async (req, res) => {
   }
   text = text.trim().substring(0, 500);
 
+  // Check if API key is available
+  if (!process.env.OPENROUTER_API_KEY) {
+    console.error("OPENROUTER_API_KEY not found in environment variables");
+    return res.status(500).json({ error: "OpenRouter API key not configured" });
+  }
+
+  console.log("API Key exists:", process.env.OPENROUTER_API_KEY ? "Yes" : "No");
+  console.log("API Key length:", process.env.OPENROUTER_API_KEY?.length || 0);
+
   // Set streaming headers
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Transfer-Encoding", "chunked");
@@ -90,32 +105,92 @@ app.post("/geminiai/chat", async (req, res) => {
   res.setHeader("X-Accel-Buffering", "no");
 
   try {
-    const stream: any = await ai.models.generateContentStream({
-      model: "gemini-2.5-flash",
-      contents: [
+    console.log("Making request to OpenRouter...");
+
+    // Create a new OpenAI instance for this request to ensure fresh config
+    const openaiInstance = new OpenAI({
+      baseURL: "https://openrouter.ai/api/v1",
+      apiKey: process.env.OPENROUTER_API_KEY,
+      defaultHeaders: {
+        "HTTP-Referer": process.env.SITE_URL || "http://localhost:3001",
+        "X-Title": process.env.SITE_NAME || "Wikipedia API Server",
+      },
+    });
+
+    const completion = await openaiInstance.chat.completions.create({
+      model: "openai/gpt-oss-20b:free",
+      messages: [
         {
           role: "user",
-          parts: [{ text }],
+          content: text,
         },
       ],
     });
 
-    for await (const chunk of stream.stream) {
-      const content = chunk.text();
-      if (content) res.write(content);
-    }
+    console.log("Response received from OpenRouter");
 
+    // Write only the content, not the entire message object
+    const content = completion.choices[0]?.message?.content;
+    if (content) {
+      res.write(content);
+    } else {
+      res.write("No response content received");
+    }
     res.end();
-  } catch (e: any) {
-    console.error("Gemini Error:", e.message);
-    res.write("\n\n[AI temporarily unavailable]");
-    res.end();
+  } catch (error: any) {
+    console.error("OpenRouter Error Details:", {
+      message: error.message,
+      status: error.status,
+      response: error.response?.data,
+      headers: error.response?.headers,
+    });
+
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: "AI service temporarily unavailable",
+        details: error.message,
+      });
+    } else {
+      res.write("\n\n[AI temporarily unavailable]");
+      res.end();
+    }
+  }
+});
+
+// Test endpoint for OpenRouter
+app.post("/api/test-openrouter", async (req, res) => {
+  try {
+    const testOpenAI = new OpenAI({
+      baseURL: "https://openrouter.ai/api/v1",
+      apiKey: process.env.OPENROUTER_API_KEY,
+    });
+
+    const completion = await testOpenAI.chat.completions.create({
+      model: "openai/gpt-oss-20b:free",
+      messages: [{ role: "user", content: "Hello" }],
+    });
+
+    res.json({
+      success: true,
+      response: completion.choices[0].message.content,
+      apiKeyConfigured: !!process.env.OPENROUTER_API_KEY,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      apiKeyConfigured: !!process.env.OPENROUTER_API_KEY,
+    });
   }
 });
 
 // Health check endpoint
 app.get("/api/health", (req, res) => {
-  res.json({ success: true, message: "Wikipedia API Server is running" });
+  res.json({
+    success: true,
+    message: "Wikipedia API Server is running",
+    openAIConfigured: !!process.env.OPENROUTER_API_KEY,
+  });
 });
 
 // Start server
